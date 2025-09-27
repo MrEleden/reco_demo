@@ -95,7 +95,7 @@ m1, m2, m3 = st.columns(3)
 with m1:
     st.metric("Total notes (user)", int(user_ratings.shape[0]))
 with m2:
-    st.metric("Likes (≥ seuil)", int((user_ratings["liked"]).sum()))
+    st.metric("Dans la plage", int((user_ratings["in_range"]).sum()))
 with m3:
     st.metric("Affichés", int(liked_view.shape[0]))
 
