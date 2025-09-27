@@ -26,14 +26,15 @@ st.set_page_config(page_title="Movie Likes Viewer", page_icon="🎬", layout="ce
 # Locate local CSVs
 # -----------------------------
 
+
 def find_csv_dir() -> str | None:
     """Try a few common locations; return the directory containing the CSVs or None."""
     env_dir = os.getenv("MOVIELENS_DIR")
     candidates = [
         env_dir,
-        os.path.join("ml-latest-small", "ml-latest-small"),  # like your screenshot
-        os.path.join("ml-latest-small"),                      # alternative
-        os.getcwd(),                                          # current dir (if CSVs are next to app.py)
+        os.path.join("ml-latest-small", "ml-latest-small"),
+        os.path.join("ml-latest-small"),
+        os.getcwd(),
     ]
     for p in candidates:
         if not p:
@@ -50,6 +51,7 @@ if CSV_DIR is None:
         "or set the env var MOVIELENS_DIR to the folder containing movies.csv, ratings.csv, links.csv."
     )
     st.stop()
+
 
 # -----------------------------
 # Load data (cached)
@@ -105,6 +107,7 @@ liked = liked.merge(movies, on="movieId", how="left")
 if "timestamp" in liked.columns:
     liked["rated_at"] = pd.to_datetime(liked["timestamp"], unit="s")
 
+
 # IMDb URL
 def to_imdb_url(imdb_id) -> str | None:
     try:
@@ -117,11 +120,17 @@ def to_imdb_url(imdb_id) -> str | None:
     except Exception:
         return None
 
+
 liked["imdb"] = liked["movieId"].map(imdb_map).map(to_imdb_url)
 
 # Select display columns
 cols = [
-    "movieId", "title", "year", "rating", "rated_at", "imdb",
+    "movieId",
+    "title",
+    "year",
+    "rating",
+    "rated_at",
+    "imdb",
 ]
 liked_view = liked.reindex(columns=[c for c in cols if c in liked.columns]).sort_values(
     by=["rating", "year", "title"], ascending=[False, False, True]
