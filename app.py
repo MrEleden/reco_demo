@@ -58,11 +58,11 @@ c1, c2 = st.columns([2, 1])
 with c1:
     user_id = st.selectbox("User", options=user_ids, index=0)
 with c2:
-    threshold = st.slider("Seuil 'like'", 0.5, 5.0, 4.0, 0.5)
+    min_thr, max_thr = st.slider("Plage de notes", 0.5, 5.0, (4.0, 5.0), 0.5)
 
 user_ratings = ratings[ratings["userId"] == user_id].copy()
-user_ratings["liked"] = user_ratings["rating"] >= threshold
-liked = user_ratings[user_ratings["liked"]].merge(movies, on="movieId", how="left")
+user_ratings["in_range"] = (user_ratings["rating"] >= min_thr) & (user_ratings["rating"] <= max_thr)
+liked = user_ratings[user_ratings["in_range"]].merge(movies, on="movieId", how="left")
 
 if "timestamp" in liked.columns:
     liked["rated_at"] = pd.to_datetime(liked["timestamp"], unit="s")
