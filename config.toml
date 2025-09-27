@@ -1,3 +1,0 @@
-[recommender]
-model = "random" # later: "popularity", "genre", etc.
-seed = 42

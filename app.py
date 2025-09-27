@@ -1,109 +1,170 @@
-# Streamlit: Movie Likes Viewer (CSV-only, max 10 per user)
-# --------------------------------------------------------
-# Run:
-#   pip install streamlit pandas
-#   streamlit run app.py
-
-import os, math
+import os
 import pandas as pd
-import streamlit as st
+import numpy as np
+import gradio as gr
 
-st.set_page_config(page_title="Movie Likes Viewer", page_icon="🎬", layout="centered")
+from src.datasets import load_dataset_with_splits, build_id_mappings, get_seen_dict
+from src.models.collab import MFRecommender, CollabTrainer, recommend_collab
+from src.models.content import ContentIndexer, recommend_content
+from src.utils import minmax_norm, to_display_df
 
+ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(ASSETS_DIR, exist_ok=True)
 
-def find_csv_dir() -> str | None:
-    env_dir = os.getenv("MOVIELENS_DIR")
-    candidates = [
-        env_dir,
-        os.path.join("ml-latest-small", "ml-latest-small"),  # ton layout
-        os.path.join("ml-latest-small"),
-        os.getcwd(),
-    ]
-    for p in candidates:
-        if p and all(os.path.exists(os.path.join(p, f)) for f in ("movies.csv", "ratings.csv", "links.csv")):
-            return p
-    return None
+warning_banner = None
 
+# ---- Load dataset with train/val split ----
+movies_df, ratings_train, ratings_val = load_dataset_with_splits(DATA_DIR)
+warning_banner = getattr(movies_df, "__warning__", None)
 
-CSV_DIR = find_csv_dir()
-if CSV_DIR is None:
-    st.error(
-        "Impossible de trouver les CSV. Place-les dans ml-latest-small/ml-latest-small/ "
-        "ou définis MOVIELENS_DIR vers le dossier contenant movies.csv/ratings.csv/links.csv."
+# ID mappings from TRAIN set
+uid2idx, idx2uid, iid2idx, idx2iid = build_id_mappings(ratings_train, movies_df)
+seen_train = get_seen_dict(ratings_train)
+
+# ---- COLLAB: init + quick train on TRAIN ----
+collab = MFRecommender(num_users=len(uid2idx), num_items=len(iid2idx), k=32)
+trainer = CollabTrainer(
+    model=collab,
+    ratings_df=ratings_train,
+    uid2idx=uid2idx,
+    iid2idx=iid2idx,
+    min_rating=4.0,
+    negative_per_positive=1,
+    max_users=20000,
+    max_items=50000,
+    batch_size=4096,
+    lr=0.05,
+)
+
+if len(ratings_train) > 0 and len(uid2idx) > 0 and len(iid2idx) > 0:
+    trainer.train(epochs=3, verbose=False)
+
+# ---- CONTENT: build TF-IDF index ----
+content = ContentIndexer(movies_df)
+content.build()
+
+def list_users():
+    if "userId" not in ratings_train.columns or ratings_train.empty:
+        return []
+    users = sorted(pd.unique(ratings_train["userId"]).tolist())
+    return [str(u) for u in users]
+
+def _merge_scores(collab_df, content_df):
+    c = collab_df[["movieId","score"]].rename(columns={"score":"collab_score"})
+    t = content_df[["movieId","title","score"]].rename(columns={"score":"content_score"})
+    merged = pd.merge(c, t, on="movieId", how="left")
+    merged["content_score"] = merged["content_score"].fillna(0.0)
+
+    # Ensure titles by joining with movies_df
+    mv = movies_df[["movieId","title"]].rename(columns={"title":"_mv_title"})
+    merged = merged.merge(mv, on="movieId", how="left")
+    if "title" not in merged:
+        merged["title"] = merged["_mv_title"]
+    else:
+        merged["title"] = merged["title"].fillna(merged["_mv_title"])
+    if "_mv_title" in merged.columns:
+        merged = merged.drop(columns=["_mv_title"])
+
+    return merged
+
+def _history_tables(user_id, min_positive=4.0):
+    trn = ratings_train[ratings_train["userId"] == user_id].copy()
+    val = ratings_val[ratings_val["userId"] == user_id].copy()
+
+    def _prep(d):
+        if d.empty:
+            return pd.DataFrame(columns=["rank","movieId","title","rating"])
+        d = d.merge(movies_df[["movieId","title"]], on="movieId", how="left")
+        d["title"] = d["title"].fillna("")
+        d = d.sort_values(["rating","movieId"], ascending=[False, True]).copy()
+        d = d[["movieId","title","rating"]]
+        d.insert(0, "rank", np.arange(1, len(d)+1))
+        d["rating"] = d["rating"].round(2)
+        return d
+
+    liked_train = trn[trn["rating"] >= float(min_positive)]
+    return _prep(liked_train), _prep(trn), _prep(val)
+
+def _annotate_with_val(df, user_id):
+    val_u = ratings_val[ratings_val["userId"] == user_id][["movieId","rating"]]
+    if val_u.empty:
+        df["in_val"] = False
+        df["val_rating"] = np.nan
+        return df
+    val_map = dict(zip(val_u["movieId"].tolist(), val_u["rating"].tolist()))
+    df["val_rating"] = df["movieId"].map(val_map)
+    df["in_val"] = df["val_rating"].notna()
+    return df
+
+def recommend(user_id_str, alpha, top_k):
+    try:
+        user_id = int(user_id_str)
+    except:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # collab scores for all items
+    collab_scores = recommend_collab(
+        model=collab,
+        user_id=user_id,
+        uid2idx=uid2idx,
+        idx2iid=idx2iid,
+        seen=seen_train,
+        return_scores=True,
     )
-    st.stop()
+    # content scores (use TRAIN interactions to build profile)
+    content_scores = recommend_content(
+        content=content,
+        user_id=user_id,
+        ratings_df=ratings_train,
+        seen=seen_train,
+        min_positive=4.0,
+    )
 
+    # combine + blend
+    merged = _merge_scores(collab_scores, content_scores)
+    c_norm = minmax_norm(merged["collab_score"].values)
+    t_norm = minmax_norm(merged["content_score"].values)
+    merged["hybrid_score"] = alpha * c_norm + (1 - alpha) * t_norm
 
-@st.cache_data(show_spinner=True)
-def load_data(csv_dir: str):
-    movies = pd.read_csv(os.path.join(csv_dir, "movies.csv"))
-    ratings = pd.read_csv(os.path.join(csv_dir, "ratings.csv"))
-    links = pd.read_csv(os.path.join(csv_dir, "links.csv"))
-    movies["year"] = movies["title"].str.extract(r"\((\d{4})\)")[0].astype("float")
-    imdb_map = dict(zip(links["movieId"], links["imdbId"]))
-    return movies, ratings, imdb_map
+    # mask only TRAIN seen (allow validation items to appear)
+    seen_items = seen_train.get(user_id, set())
+    if seen_items:
+        merged = merged[~merged["movieId"].isin(seen_items)]
 
+    # annotate with validation info
+    merged = _annotate_with_val(merged, user_id)
 
-movies, ratings, imdb_map = load_data(CSV_DIR)
+    merged = merged.sort_values("hybrid_score", ascending=False).head(int(top_k))
+    recs_df = to_display_df(merged, score_col="hybrid_score", extra_cols=["in_val","val_rating"])
 
-st.title("🎬 Movie Likes Viewer (max 10)")
-st.caption("Sélectionne un userId et un seuil : on affiche au **maximum 10** films qu'il/elle a likés.")
+    # History tables
+    liked_train_df, train_df, val_df = _history_tables(user_id)
+    return recs_df, liked_train_df, train_df, val_df
 
-user_ids = sorted(ratings["userId"].unique().tolist())
-if not user_ids:
-    st.warning("Aucun userId dans ratings.csv.")
-    st.stop()
+with gr.Blocks(title="Movie Recommender (Hybrid/Collab/Content)") as demo:
+    gr.Markdown("# 🎬 Movie Recommender\nPick a user and get movies they haven't watched yet.")
+    if warning_banner:
+        gr.Markdown(f"> ⚠️ **Notice:** {warning_banner}")
+    with gr.Row():
+        choices = list_users()
+        user_dd = gr.Dropdown(choices=choices, label="User", value=choices[0] if choices else None)
+        alpha = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Hybrid weight α (collab vs content)")
+        topk = gr.Slider(1, 50, value=10, step=1, label="Top-K")
+    btn = gr.Button("Recommend")
 
-c1, c2 = st.columns([2, 1])
-with c1:
-    user_id = st.selectbox("User", options=user_ids, index=0)
-with c2:
-    min_thr, max_thr = st.slider("Plage de notes", 0.5, 5.0, (4.0, 5.0), 0.5)
+    with gr.Tabs():
+        with gr.Tab("Recommendations"):
+            out_recs = gr.Dataframe(headers=["rank","movieId","title","score","in_val","val_rating"], interactive=False)
+        with gr.Tab("User history (Train)"):
+            gr.Markdown("**Liked in Train (rating ≥ 4)**")
+            out_liked_train = gr.Dataframe(headers=["rank","movieId","title","rating"], interactive=False)
+            gr.Markdown("**All Train**")
+            out_train = gr.Dataframe(headers=["rank","movieId","title","rating"], interactive=False)
+        with gr.Tab("User history (Validation)"):
+            out_val = gr.Dataframe(headers=["rank","movieId","title","rating"], interactive=False)
 
-user_ratings = ratings[ratings["userId"] == user_id].copy()
-user_ratings["in_range"] = (user_ratings["rating"] >= min_thr) & (user_ratings["rating"] <= max_thr)
-liked = user_ratings[user_ratings["in_range"]].merge(movies, on="movieId", how="left")
+    btn.click(fn=recommend, inputs=[user_dd, alpha, topk], outputs=[out_recs, out_liked_train, out_train, out_val])
 
-if "timestamp" in liked.columns:
-    liked["rated_at"] = pd.to_datetime(liked["timestamp"], unit="s")
-
-
-def imdb_url(imdb_id) -> str | None:
-    try:
-        if math.isnan(imdb_id):
-            return None
-    except Exception:
-        pass
-    try:
-        return f"https://www.imdb.com/title/tt{int(imdb_id):07d}/"
-    except Exception:
-        return None
-
-
-liked["imdb"] = liked["movieId"].map(imdb_map).map(imdb_url)
-
-cols = ["movieId", "title", "year", "rating", "rated_at", "imdb"]
-liked_view = (
-    liked.reindex(columns=[c for c in cols if c in liked.columns])
-    .sort_values(by=["rating", "year", "title"], ascending=[False, False, True])
-    .head(10)  # <<<<<< cap à 10 films max
-)
-
-st.markdown("---")
-st.subheader("👍 Films likés")
-m1, m2, m3 = st.columns(3)
-with m1:
-    st.metric("Total notes (user)", int(user_ratings.shape[0]))
-with m2:
-    st.metric("Dans la plage", int((user_ratings["in_range"]).sum()))
-with m3:
-    st.metric("Affichés", int(liked_view.shape[0]))
-
-st.dataframe(liked_view.reset_index(drop=True), use_container_width=True, hide_index=True)
-
-st.download_button(
-    label="⬇️ Exporter (CSV, max 10)",
-    data=liked_view.to_csv(index=False),
-    file_name=f"user_{user_id}_liked_movies_top10.csv",
-    mime="text/csv",
-)
+if __name__ == "__main__":
+    demo.launch()
