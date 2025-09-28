@@ -14,12 +14,14 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 
 warning_banner = None
 
-# ---- Load dataset with train/val split ----
-movies_df, ratings_train, ratings_val = load_dataset_with_splits(DATA_DIR)
-warning_banner = getattr(movies_df, "__warning__", None)
+# ---- Load dataset with train/val/test split ----
+movies_df, ratings_train, ratings_val, ratings_test = load_dataset_with_splits(DATA_DIR)
+
 
 # ID mappings from TRAIN set
 uid2idx, idx2uid, iid2idx, idx2iid = build_id_mappings(ratings_train, movies_df)
+
+# safeguard: seen items in TRAIN per user
 seen_train = get_seen_dict(ratings_train)
 
 # ---- COLLAB: init + quick train on TRAIN ----
@@ -37,27 +39,29 @@ trainer = CollabTrainer(
     lr=0.05,
 )
 
-if len(ratings_train) > 0 and len(uid2idx) > 0 and len(iid2idx) > 0:
-    trainer.train(epochs=3, verbose=False)
+trainer.train(epochs=3, verbose=False)
 
 # ---- CONTENT: build TF-IDF index ----
 content = ContentIndexer(movies_df)
 content.build()
 
+
 def list_users():
+    # Keep it simple: users that exist in TRAIN (they have embeddings)
     if "userId" not in ratings_train.columns or ratings_train.empty:
         return []
     users = sorted(pd.unique(ratings_train["userId"]).tolist())
     return [str(u) for u in users]
 
+
 def _merge_scores(collab_df, content_df):
-    c = collab_df[["movieId","score"]].rename(columns={"score":"collab_score"})
-    t = content_df[["movieId","title","score"]].rename(columns={"score":"content_score"})
+    c = collab_df[["movieId", "score"]].rename(columns={"score": "collab_score"})
+    t = content_df[["movieId", "title", "score"]].rename(columns={"score": "content_score"})
     merged = pd.merge(c, t, on="movieId", how="left")
     merged["content_score"] = merged["content_score"].fillna(0.0)
 
-    # Ensure titles by joining with movies_df
-    mv = movies_df[["movieId","title"]].rename(columns={"title":"_mv_title"})
+    # Ensure titles by joining with movies_df as a fallback
+    mv = movies_df[["movieId", "title"]].rename(columns={"title": "_mv_title"})
     merged = merged.merge(mv, on="movieId", how="left")
     if "title" not in merged:
         merged["title"] = merged["_mv_title"]
@@ -65,45 +69,52 @@ def _merge_scores(collab_df, content_df):
         merged["title"] = merged["title"].fillna(merged["_mv_title"])
     if "_mv_title" in merged.columns:
         merged = merged.drop(columns=["_mv_title"])
-
     return merged
+
 
 def _history_tables(user_id, min_positive=4.0):
     trn = ratings_train[ratings_train["userId"] == user_id].copy()
     val = ratings_val[ratings_val["userId"] == user_id].copy()
+    tst = ratings_test[ratings_test["userId"] == user_id].copy()
 
     def _prep(d):
         if d.empty:
-            return pd.DataFrame(columns=["rank","movieId","title","rating"])
-        d = d.merge(movies_df[["movieId","title"]], on="movieId", how="left")
+            return pd.DataFrame(columns=["rank", "movieId", "title", "rating"])
+        d = d.merge(movies_df[["movieId", "title"]], on="movieId", how="left")
         d["title"] = d["title"].fillna("")
-        d = d.sort_values(["rating","movieId"], ascending=[False, True]).copy()
-        d = d[["movieId","title","rating"]]
-        d.insert(0, "rank", np.arange(1, len(d)+1))
+        d = d.sort_values(["rating", "movieId"], ascending=[False, True]).copy()
+        d = d[["movieId", "title", "rating"]]
+        d.insert(0, "rank", np.arange(1, len(d) + 1))
         d["rating"] = d["rating"].round(2)
         return d
 
     liked_train = trn[trn["rating"] >= float(min_positive)]
-    return _prep(liked_train), _prep(trn), _prep(val)
+    return _prep(liked_train), _prep(trn), _prep(val), _prep(tst)
 
-def _annotate_with_val(df, user_id):
-    val_u = ratings_val[ratings_val["userId"] == user_id][["movieId","rating"]]
-    if val_u.empty:
-        df["in_val"] = False
-        df["val_rating"] = np.nan
-        return df
-    val_map = dict(zip(val_u["movieId"].tolist(), val_u["rating"].tolist()))
+
+def _annotate_with_holdouts(df, user_id):
+    # Validation
+    val_u = ratings_val[ratings_val["userId"] == user_id][["movieId", "rating"]]
+    val_map = dict(zip(val_u["movieId"], val_u["rating"])) if not val_u.empty else {}
     df["val_rating"] = df["movieId"].map(val_map)
     df["in_val"] = df["val_rating"].notna()
+
+    # Test
+    test_u = ratings_test[ratings_test["userId"] == user_id][["movieId", "rating"]]
+    test_map = dict(zip(test_u["movieId"], test_u["rating"])) if not test_u.empty else {}
+    df["test_rating"] = df["movieId"].map(test_map)
+    df["in_test"] = df["test_rating"].notna()
     return df
+
 
 def recommend(user_id_str, alpha, top_k):
     try:
         user_id = int(user_id_str)
     except:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, empty
 
-    # collab scores for all items
+    # ---- collab scores for all items
     collab_scores = recommend_collab(
         model=collab,
         user_id=user_id,
@@ -112,7 +123,8 @@ def recommend(user_id_str, alpha, top_k):
         seen=seen_train,
         return_scores=True,
     )
-    # content scores (use TRAIN interactions to build profile)
+
+    # ---- content scores (use TRAIN interactions to build profile)
     content_scores = recommend_content(
         content=content,
         user_id=user_id,
@@ -121,31 +133,38 @@ def recommend(user_id_str, alpha, top_k):
         min_positive=4.0,
     )
 
-    # combine + blend
+    # ---- combine + blend
     merged = _merge_scores(collab_scores, content_scores)
     c_norm = minmax_norm(merged["collab_score"].values)
     t_norm = minmax_norm(merged["content_score"].values)
     merged["hybrid_score"] = alpha * c_norm + (1 - alpha) * t_norm
 
-    # mask only TRAIN seen (allow validation items to appear)
+    # ---- mask only TRAIN seen (allow val/test items to appear)
     seen_items = seen_train.get(user_id, set())
     if seen_items:
         merged = merged[~merged["movieId"].isin(seen_items)]
 
-    # annotate with validation info
-    merged = _annotate_with_val(merged, user_id)
+    # ---- annotate with validation & test info
+    merged = _annotate_with_holdouts(merged, user_id)
 
+    # ---- sort & format
     merged = merged.sort_values("hybrid_score", ascending=False).head(int(top_k))
-    recs_df = to_display_df(merged, score_col="hybrid_score", extra_cols=["in_val","val_rating"])
+    recs_df = to_display_df(
+        merged,
+        score_col="hybrid_score",
+        extra_cols=["in_val", "val_rating", "in_test", "test_rating"],
+    )
 
-    # History tables
-    liked_train_df, train_df, val_df = _history_tables(user_id)
-    return recs_df, liked_train_df, train_df, val_df
+    # ---- History tables
+    liked_train_df, train_df, val_df, test_df = _history_tables(user_id)
+    return recs_df, liked_train_df, train_df, val_df, test_df
 
-with gr.Blocks(title="Movie Recommender (Hybrid/Collab/Content)") as demo:
+
+with gr.Blocks(title="🎬 Movie Recommender (Hybrid/Collab/Content)") as demo:
     gr.Markdown("# 🎬 Movie Recommender\nPick a user and get movies they haven't watched yet.")
     if warning_banner:
         gr.Markdown(f"> ⚠️ **Notice:** {warning_banner}")
+
     with gr.Row():
         choices = list_users()
         user_dd = gr.Dropdown(choices=choices, label="User", value=choices[0] if choices else None)
@@ -155,16 +174,23 @@ with gr.Blocks(title="Movie Recommender (Hybrid/Collab/Content)") as demo:
 
     with gr.Tabs():
         with gr.Tab("Recommendations"):
-            out_recs = gr.Dataframe(headers=["rank","movieId","title","score","in_val","val_rating"], interactive=False)
+            out_recs = gr.Dataframe(
+                headers=["rank", "movieId", "title", "score", "in_val", "val_rating", "in_test", "test_rating"],
+                interactive=False,
+            )
         with gr.Tab("User history (Train)"):
             gr.Markdown("**Liked in Train (rating ≥ 4)**")
-            out_liked_train = gr.Dataframe(headers=["rank","movieId","title","rating"], interactive=False)
+            out_liked_train = gr.Dataframe(headers=["rank", "movieId", "title", "rating"], interactive=False)
             gr.Markdown("**All Train**")
-            out_train = gr.Dataframe(headers=["rank","movieId","title","rating"], interactive=False)
+            out_train = gr.Dataframe(headers=["rank", "movieId", "title", "rating"], interactive=False)
         with gr.Tab("User history (Validation)"):
-            out_val = gr.Dataframe(headers=["rank","movieId","title","rating"], interactive=False)
+            out_val = gr.Dataframe(headers=["rank", "movieId", "title", "rating"], interactive=False)
+        with gr.Tab("User history (Test)"):
+            out_test = gr.Dataframe(headers=["rank", "movieId", "title", "rating"], interactive=False)
 
-    btn.click(fn=recommend, inputs=[user_dd, alpha, topk], outputs=[out_recs, out_liked_train, out_train, out_val])
+    btn.click(
+        fn=recommend, inputs=[user_dd, alpha, topk], outputs=[out_recs, out_liked_train, out_train, out_val, out_test]
+    )
 
 if __name__ == "__main__":
     demo.launch()
